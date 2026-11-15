@@ -1,0 +1,1833 @@
+
+"use client";
+
+import Link from "next/link";
+import { ChangeEvent, useState } from "react";
+
+import DocumentDetails from "@/components/documents/DocumentDetails";
+import DocumentStatusBadge from "@/components/documents/DocumentStatusBadge";
+import SourceInvoiceEvidence from "@/components/documents/SourceInvoiceEvidence";
+
+import {
+  type DocumentCorrectionPayload,
+  type DocumentDetails as DocumentDetailsRecord,
+  type DoclingEnrichment,
+  type InvoiceApprovalResponse,
+  type UAEInvoice,
+  type UAEInvoiceItem,
+  type ValidationResult,
+  approveDocument,
+  correctDocument,
+  getDocument,
+  rejectDocument,
+  validateDocument,
+} from "@/lib/api";
+
+type ItemDraft = Record<keyof UAEInvoiceItem, string>;
+
+type Draft = {
+  invoice_number: string;
+  supplier_name: string;
+  supplier_address: string;
+  supplier_emirate: string;
+  supplier_trn: string;
+  customer_name: string;
+  customer_address: string;
+  customer_emirate: string;
+  customer_email: string;
+  customer_trn: string;
+  invoice_type: string;
+  issue_date: string;
+  supply_date: string;
+  due_date: string;
+  place_of_supply: string;
+  currency: string;
+  subtotal_aed: string;
+  discount_aed: string;
+  vat_amount_aed: string;
+  total_amount_aed: string;
+  amount_in_words: string;
+  notes: string;
+  items: ItemDraft[];
+};
+
+type Props = {
+  document: DocumentDetailsRecord;
+  onUpdated: (document: DocumentDetailsRecord) => void;
+};
+
+type BusyAction = "save" | "validate" | "approve" | "reject" | null;
+
+const ITEM_COLUMNS: {
+  key: keyof ItemDraft;
+  label: string;
+  type?: string;
+}[] = [
+  { key: "description", label: "Description" },
+  { key: "quantity", label: "Qty", type: "number" },
+  { key: "unit", label: "Unit" },
+  { key: "unit_price_aed", label: "Unit price (AED)", type: "number" },
+  { key: "discount_aed", label: "Discount (AED)", type: "number" },
+  { key: "taxable_value_aed", label: "Taxable (AED)", type: "number" },
+  { key: "vat_rate", label: "VAT %", type: "number" },
+  { key: "vat_amount_aed", label: "VAT amount (AED)", type: "number" },
+  { key: "line_total_aed", label: "Line total (AED)", type: "number" },
+];
+
+const DUPLICATE_BLOCKING_STATUSES = [
+  "same_invoice",
+  "conflicting_number",
+  "duplicate_upload",
+  "duplicate",
+  "ambiguous",
+];
+
+// ============================================================
+// DATA HELPERS
+// ============================================================
+
+function objectValue(value: unknown): Record<string, unknown> {
+  return value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function valueString(value: unknown): string {
+  return value === null || value === undefined
+    ? ""
+    : String(value);
+}
+
+function hasOwn(
+  value: Record<string, unknown>,
+  key: string,
+): boolean {
+  return Object.prototype.hasOwnProperty.call(value, key);
+}
+
+function emptyItem(): ItemDraft {
+  return {
+    description: "",
+    quantity: "",
+    unit: "",
+    unit_price_aed: "",
+    discount_aed: "",
+    taxable_value_aed: "",
+    vat_rate: "",
+    vat_amount_aed: "",
+    line_total_aed: "",
+  };
+}
+
+function formatAmount(
+  value: unknown,
+  currency: string | null = "AED",
+): string {
+  if (value === null || value === undefined || value === "") {
+    return "—";
+  }
+
+  const amount = Number(value);
+
+  if (!Number.isFinite(amount)) {
+    return String(value);
+  }
+
+  const formatted = amount.toLocaleString("en-AE", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+
+  return currency ? `${currency.toUpperCase()} ${formatted}` : formatted;
+}
+
+function normalizeCurrency(value: unknown): string {
+  return valueString(value).trim().toUpperCase();
+}
+
+function normalizeDocumentType(value: unknown): string {
+  return valueString(value).trim().toLowerCase();
+}
+
+function hasUsableInvoiceItems(
+  value: unknown,
+): value is Record<string, unknown>[] {
+  return Array.isArray(value) && value.some((item) => {
+    const row = objectValue(item);
+
+    return [
+      "description",
+      "quantity",
+      "unit_price_aed",
+      "line_total_aed",
+    ].some((key) => valueString(row[key]).trim() !== "");
+  });
+}
+
+function chooseInvoiceItems(
+  corrected: Record<string, unknown>,
+  legacyCorrected: Record<string, unknown>,
+  reviewed: Record<string, unknown>,
+  extractedFields: Record<string, unknown>,
+  structured: Record<string, unknown>,
+  extracted: Record<string, unknown>,
+): unknown[] {
+  const candidates = [
+    corrected.items,
+    legacyCorrected.items,
+    reviewed.items,
+    extractedFields.items,
+    structured.items,
+    extracted.items,
+  ];
+
+  const usable = candidates.find(hasUsableInvoiceItems);
+
+  if (usable) return usable;
+
+  return Array.isArray(corrected.items)
+    ? corrected.items
+    : [];
+}
+
+function getSourceInvoice(
+  document: DocumentDetailsRecord,
+  index: number,
+): UAEInvoice {
+  const data = objectValue(document.extracted_data);
+  const extraction = objectValue(data.structured_extraction);
+  const invoices = Array.isArray(extraction.invoices)
+    ? extraction.invoices
+    : [];
+
+  const structured = objectValue(data.structured_invoice);
+
+  if (index === 0 && Object.keys(structured).length > 0) {
+    return structured as UAEInvoice;
+  }
+
+  return objectValue(invoices[index]) as UAEInvoice;
+}
+
+function getInvoiceCount(document: DocumentDetailsRecord): number {
+  const data = objectValue(document.extracted_data);
+  const extraction = objectValue(data.structured_extraction);
+  const invoices = Array.isArray(extraction.invoices)
+    ? extraction.invoices
+    : [];
+
+  return Math.max(
+    invoices.length,
+    Object.keys(objectValue(data.structured_invoice)).length ? 1 : 0,
+  );
+}
+
+function getApprovedIndices(document: DocumentDetailsRecord): number[] {
+  const data = objectValue(document.extracted_data);
+
+  return Array.isArray(data.approved_invoice_indices)
+    ? data.approved_invoice_indices.filter(
+        (value): value is number => typeof value === "number",
+      )
+    : [];
+}
+
+function getFirstUnapprovedIndex(
+  document: DocumentDetailsRecord,
+): number {
+  const approved = getApprovedIndices(document);
+  const count = getInvoiceCount(document);
+
+  return (
+    Array.from({ length: count }, (_, index) => index).find(
+      (index) => !approved.includes(index),
+    ) ?? 0
+  );
+}
+
+function getValidation(
+  document: DocumentDetailsRecord,
+  index: number,
+): ValidationResult | null {
+  const data = objectValue(document.extracted_data);
+  const validations = objectValue(data.invoice_validations);
+  const stored = objectValue(validations[String(index)]);
+  const selected = objectValue(stored.result);
+
+  if (Object.keys(selected).length) {
+    return selected as ValidationResult;
+  }
+
+  if (index === 0) {
+    const legacy = objectValue(data.validation);
+
+    if (Object.keys(legacy).length) {
+      return legacy as ValidationResult;
+    }
+  }
+
+  return null;
+}
+
+function invoiceTotal(
+  ...sources: Record<string, unknown>[]
+): string {
+  for (const source of sources) {
+    if (hasOwn(source, "total_amount_aed")) {
+      return valueString(source.total_amount_aed);
+    }
+
+    if (hasOwn(source, "amount_aed")) {
+      return valueString(source.amount_aed);
+    }
+  }
+
+  return "";
+}
+
+// ============================================================
+// BUILD EDITABLE DRAFT
+// ============================================================
+
+function buildDraft(
+  document: DocumentDetailsRecord,
+  index: number,
+): Draft {
+  const data = objectValue(document.extracted_data);
+  const extraction = objectValue(data.structured_extraction);
+  const invoices = Array.isArray(extraction.invoices)
+    ? extraction.invoices
+    : [];
+
+  const source = getSourceInvoice(document, index);
+  const extractedFields =
+    index === 0 ? objectValue(data.fields) : {};
+
+  const reviews = objectValue(data.invoice_reviews);
+  const corrected = objectValue(reviews[String(index)]);
+  const reviewed =
+    index === 0 ? objectValue(data.reviewed_values) : {};
+  const legacyCorrected =
+    index === 0 ? objectValue(data.corrected_values) : {};
+
+  const merged: Record<string, unknown> = {
+    ...source,
+    ...extractedFields,
+    ...reviewed,
+    ...legacyCorrected,
+    ...corrected,
+  };
+
+  const rawItems = chooseInvoiceItems(
+    corrected,
+    legacyCorrected,
+    reviewed,
+    extractedFields,
+    source,
+    objectValue(invoices[index]),
+  );
+
+  const text = (key: string) => valueString(merged[key]);
+  const date = (key: string) => text(key).slice(0, 10);
+
+  return {
+    invoice_number: text("invoice_number"),
+    supplier_name: text("supplier_name"),
+    supplier_address: text("supplier_address"),
+    supplier_emirate: text("supplier_emirate"),
+    supplier_trn: text("supplier_trn"),
+    customer_name: text("customer_name"),
+    customer_address: text("customer_address"),
+    customer_emirate: text("customer_emirate"),
+    customer_email: text("customer_email"),
+    customer_trn: text("customer_trn"),
+    invoice_type: valueString(
+      merged.document_type ?? merged.invoice_type,
+    ),
+    issue_date: date("issue_date"),
+    supply_date: date("supply_date"),
+    due_date: date("due_date"),
+    place_of_supply: text("place_of_supply"),
+    currency: text("currency"),
+    subtotal_aed: text("subtotal_aed"),
+    discount_aed: text("discount_aed"),
+    vat_amount_aed: text("vat_amount_aed"),
+    total_amount_aed: invoiceTotal(
+      corrected,
+      legacyCorrected,
+      reviewed,
+      extractedFields,
+      source,
+    ),
+    amount_in_words: text("amount_in_words"),
+    notes: valueString(merged.notes ?? merged.review_notes),
+    items: rawItems.map((item) => {
+      const row = objectValue(item);
+
+      return {
+        description: valueString(row.description),
+        quantity: valueString(row.quantity),
+        unit: valueString(row.unit),
+        unit_price_aed: valueString(row.unit_price_aed),
+        discount_aed: valueString(row.discount_aed),
+        taxable_value_aed: valueString(row.taxable_value_aed),
+        vat_rate: valueString(row.vat_rate),
+        vat_amount_aed: valueString(row.vat_amount_aed),
+        line_total_aed: valueString(row.line_total_aed),
+      };
+    }),
+  };
+}
+
+// ============================================================
+// BUILD BACKEND PAYLOAD
+// ============================================================
+
+function toPayload(
+  draft: Draft,
+  invoiceIndex: number,
+): DocumentCorrectionPayload {
+  const optional = (value: string) => value.trim() || null;
+  const totalAmount = optional(draft.total_amount_aed);
+
+  return {
+    invoice_index: invoiceIndex,
+    invoice_number: optional(draft.invoice_number),
+    supplier_name: optional(draft.supplier_name),
+    supplier_address: optional(draft.supplier_address),
+    supplier_emirate: optional(draft.supplier_emirate),
+    supplier_trn: optional(draft.supplier_trn),
+    customer_name: optional(draft.customer_name),
+    customer_address: optional(draft.customer_address),
+    customer_emirate: optional(draft.customer_emirate),
+    customer_email: optional(draft.customer_email),
+    customer_trn: optional(draft.customer_trn),
+    issue_date: optional(draft.issue_date),
+    supply_date: optional(draft.supply_date),
+    due_date: optional(draft.due_date),
+    place_of_supply: optional(draft.place_of_supply),
+    currency: optional(draft.currency),
+    subtotal_aed: optional(draft.subtotal_aed),
+    discount_aed: optional(draft.discount_aed),
+    vat_amount_aed: optional(draft.vat_amount_aed),
+    amount_aed: totalAmount,
+    total_amount_aed: totalAmount,
+    notes: optional(draft.notes),
+    items: draft.items.map((item) => ({
+      description: optional(item.description),
+      quantity: optional(item.quantity),
+      unit: optional(item.unit),
+      unit_price_aed: optional(item.unit_price_aed),
+      discount_aed: optional(item.discount_aed),
+      taxable_value_aed: optional(item.taxable_value_aed),
+      vat_rate: optional(item.vat_rate),
+      vat_amount_aed: optional(item.vat_amount_aed),
+      line_total_aed: optional(item.line_total_aed),
+    })),
+  };
+}
+
+// ============================================================
+// REUSABLE FIELD COMPONENT
+// ============================================================
+
+function TextField({
+  label,
+  value,
+  type = "text",
+  required = false,
+  disabled = false,
+  onChange,
+  placeholder,
+}: {
+  label: string;
+  value: string;
+  type?: string;
+  required?: boolean;
+  disabled?: boolean;
+  onChange: (value: string) => void;
+  placeholder?: string;
+}) {
+  const id = `invoice-${label.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`;
+
+  return (
+    <div className="col-md-6">
+      <label className="form-label small fw-semibold" htmlFor={id}>
+        {label}
+      </label>
+
+      <input
+        id={id}
+        className="form-control"
+        type={type}
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        required={required}
+        disabled={disabled}
+        placeholder={placeholder}
+      />
+    </div>
+  );
+}
+
+// ============================================================
+// VALIDATION PANEL
+// ============================================================
+
+function ValidationPanel({
+  result,
+}: {
+  result: ValidationResult | null;
+}) {
+  if (!result) {
+    return (
+      <div className="alert alert-info py-2 small mt-3">
+        Save or validate the current values to see the latest
+        server-side checks.
+      </div>
+    );
+  }
+
+  const checks = objectValue(result.checks);
+  const duplicate = objectValue(checks.duplicate);
+  const totals = objectValue(result.calculated_totals);
+  const errors = Array.isArray(result.errors) ? result.errors : [];
+  const warnings = Array.isArray(result.warnings)
+    ? result.warnings
+    : [];
+
+  const checkRows = [
+    ["Supplier TRN", checks.supplier_trn],
+    ["Buyer TRN", checks.customer_trn],
+    ["Currency", checks.currency],
+    ["Line items", checks.line_items],
+    ["VAT", checks.vat],
+    ["Invoice total", checks.totals],
+    ["Duplicate check", checks.duplicate],
+  ] as const;
+
+  return (
+    <section className="document-card mt-3">
+      <div className="d-flex justify-content-between align-items-center gap-2 mb-3">
+        <div>
+          <h3 className="document-subtitle mb-1">
+            Validation results
+          </h3>
+          <p className="small text-secondary mb-0">
+            Server-side checks and calculated AED accounting values.
+          </p>
+        </div>
+
+        <span
+          className={`badge ${
+            result.is_valid ? "text-bg-success" : "text-bg-danger"
+          }`}
+        >
+          {result.is_valid ? "Passed" : "Errors found"}
+        </span>
+      </div>
+
+      <div className="row g-2">
+        {checkRows.map(([label, raw]) => {
+          const detail = objectValue(raw);
+
+          const valid =
+            typeof detail.is_valid === "boolean"
+              ? detail.is_valid
+              : typeof detail.matches === "boolean"
+                ? detail.matches
+                : label === "Duplicate check"
+                  ? duplicate.status === "clear"
+                  : label === "Currency"
+                    ? detail.is_supported_for_aed_ledger === true
+                    : null;
+
+          const message =
+            typeof detail.message === "string"
+              ? detail.message
+              : typeof detail.count === "number"
+                ? `${detail.count} item(s) checked`
+                : "Review details in the source document";
+
+          return (
+            <div className="col-md-6" key={label}>
+              <div className="document-check-row">
+                <span
+                  className={`badge ${
+                    valid === true
+                      ? "text-bg-success"
+                      : valid === false
+                        ? "text-bg-danger"
+                        : "text-bg-warning"
+                  }`}
+                >
+                  {valid === true ? "Pass" : valid === false ? "Check" : "Review"}
+                </span>
+                <div>
+                  <strong>{label}</strong>
+                  <div className="small text-secondary">{message}</div>
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {Array.isArray(duplicate.matches) &&
+        duplicate.matches.length > 0 && (
+          <div className="alert alert-warning small mt-3">
+            Potential duplicate invoice records were found.
+            Review the duplicate-check details before approval.
+          </div>
+        )}
+
+      <div className="document-financial-grid mt-3">
+        {[
+          ["Calculated subtotal", totals.subtotal_aed],
+          ["Calculated discount", totals.discount_aed],
+          ["Calculated VAT", totals.vat_amount_aed],
+          ["Calculated grand total", totals.total_amount_aed],
+        ].map(([label, amount]) => (
+          <div className="document-financial-cell" key={String(label)}>
+            <span>{String(label)}</span>
+            <strong>{formatAmount(amount, "AED")}</strong>
+          </div>
+        ))}
+      </div>
+
+      {errors.length > 0 && (
+        <div className="alert alert-danger small mt-3 mb-2">
+          <strong>Items to fix</strong>
+          <ul className="mb-0 mt-2">
+            {errors.map((message, index) => (
+              <li key={index}>{message}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {warnings.length > 0 && (
+        <div className="alert alert-warning small mt-3 mb-0">
+          <strong>Warnings</strong>
+          <ul className="mb-0 mt-2">
+            {warnings.map((message, index) => (
+              <li key={index}>{message}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </section>
+  );
+}
+
+// ============================================================
+// ADDITIONAL EXTRACTION EVIDENCE
+// ============================================================
+
+function ExtractionEvidence({
+  invoice,
+}: {
+  invoice: UAEInvoice;
+}) {
+  const evidence = objectValue(invoice.field_evidence);
+  const unresolved = Array.isArray(invoice.unresolved_fields)
+    ? invoice.unresolved_fields
+    : [];
+
+  const paymentTerms = valueString(invoice.payment_terms);
+  const engine = valueString(invoice.extraction_method);
+  const parserVersion = valueString(invoice.parser_version);
+
+  const confidence =
+    typeof invoice.extraction_confidence === "number"
+      ? invoice.extraction_confidence
+      : null;
+
+  const keys = Object.keys(evidence);
+
+  if (
+    !keys.length &&
+    !unresolved.length &&
+    !paymentTerms &&
+    !engine &&
+    !parserVersion &&
+    confidence === null
+  ) {
+    return null;
+  }
+
+  return (
+    <section
+      className="document-card mt-3"
+      aria-label="Extraction evidence"
+    >
+      <h3 className="document-subtitle mb-2">
+        Extraction evidence
+      </h3>
+
+      <p className="small text-secondary mb-2">
+        Source references are extraction hints. Confirm uncertain
+        values against the original document.
+      </p>
+
+      <div className="d-flex flex-wrap gap-2 mb-2">
+        {engine && (
+          <span className="badge text-bg-light">
+            Engine: {engine}
+          </span>
+        )}
+
+        {parserVersion && (
+          <span className="badge text-bg-light">
+            Parser: {parserVersion}
+          </span>
+        )}
+
+        {confidence !== null && (
+          <span className="badge text-bg-light">
+            Confidence: {Math.round(confidence * 100)}%
+          </span>
+        )}
+      </div>
+
+      {paymentTerms && (
+        <div className="small mb-2">
+          <strong>Payment terms:</strong> {paymentTerms}
+          <div className="text-secondary">
+            Payment terms do not automatically establish a due date.
+          </div>
+        </div>
+      )}
+
+      {unresolved.length > 0 && (
+        <div className="alert alert-warning py-2 small">
+          <strong>Unresolved fields:</strong>{" "}
+          {unresolved.join(", ")}
+        </div>
+      )}
+
+      {keys.length > 0 && (
+        <details className="small">
+          <summary
+            className="fw-semibold"
+            style={{ cursor: "pointer" }}
+          >
+            View source evidence ({keys.length} fields)
+          </summary>
+
+          <div className="mt-2 d-grid gap-2">
+            {keys.map((key) => {
+              const raw = evidence[key];
+              const candidates = Array.isArray(raw) ? raw : [raw];
+
+              return (
+                <div className="border rounded p-2" key={key}>
+                  <strong>{key.replaceAll("_", " ")}</strong>
+
+                  {candidates.map((entry, index) => {
+                    const item = objectValue(entry);
+                    const sourceText = valueString(
+                      item.source_text ?? item.text,
+                    );
+                    const page = item.source_page ?? item.page;
+
+                    return (
+                      <div className="text-secondary mt-1" key={index}>
+                        {sourceText || "No source text retained"}
+                        {page != null ? ` · Page ${String(page)}` : ""}
+                      </div>
+                    );
+                  })}
+                </div>
+              );
+            })}
+          </div>
+        </details>
+      )}
+    </section>
+  );
+}
+
+// ============================================================
+// MAIN INVOICE REVIEW COMPONENT
+// ============================================================
+
+function InvoiceReviewContent({
+  document,
+  onUpdated,
+}: Props) {
+  const data = objectValue(document.extracted_data);
+  const extraction = objectValue(data.structured_extraction);
+
+  const invoices = Array.isArray(extraction.invoices)
+    ? extraction.invoices
+    : [];
+
+  const invoiceCount = getInvoiceCount(document);
+  const approvedIndices = getApprovedIndices(document);
+
+  const [invoiceIndex, setInvoiceIndex] = useState(() =>
+    getFirstUnapprovedIndex(document),
+  );
+
+  const [draft, setDraft] = useState<Draft>(() =>
+    buildDraft(document, getFirstUnapprovedIndex(document)),
+  );
+
+  const [validation, setValidation] =
+    useState<ValidationResult | null>(() =>
+      getValidation(document, getFirstUnapprovedIndex(document)),
+    );
+
+  const [busy, setBusy] = useState<BusyAction>(null);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+
+  const [approval, setApproval] =
+    useState<InvoiceApprovalResponse | null>(null);
+
+  const originalInvoice = getSourceInvoice(
+    document,
+    invoiceIndex,
+  );
+
+  const doclingEnrichment = objectValue(
+    extraction.docling_enrichment,
+  ) as DoclingEnrichment;
+
+  const originalCurrency = normalizeCurrency(
+    originalInvoice.currency,
+  );
+
+  const originalDocumentType = normalizeDocumentType(
+    originalInvoice.document_type ?? originalInvoice.invoice_type,
+  );
+
+  const isProforma =
+    originalDocumentType === "proforma_invoice";
+
+  // This decision is based on ORIGINAL extraction evidence.
+  // Editing the currency field must not bypass the restriction.
+  const sourceBlocksAedApproval =
+    originalCurrency !== "AED" || isProforma;
+
+  const locked =
+    document.processing_status === "approved" ||
+    document.processing_status === "rejected" ||
+    approvedIndices.includes(invoiceIndex);
+
+  const canEdit =
+    document.processing_status === "pending_review" &&
+    !locked;
+
+  const duplicate = objectValue(
+    objectValue(validation?.checks).duplicate,
+  );
+
+  const duplicateBlocksApproval =
+    DUPLICATE_BLOCKING_STATUSES.includes(
+      valueString(duplicate.status),
+    );
+
+  const currencyCode = normalizeCurrency(draft.currency);
+
+  const canApprove =
+    canEdit &&
+    !sourceBlocksAedApproval &&
+    currencyCode === "AED" &&
+    validation?.is_valid === true &&
+    !duplicateBlocksApproval;
+
+  const calculated = objectValue(
+    validation?.calculated_totals,
+  );
+
+  const sourceTotal =
+    originalInvoice.source_total_amount ??
+    (originalCurrency === "AED"
+      ? originalInvoice.total_amount_aed ?? originalInvoice.amount_aed
+      : null);
+
+  const reviewedAmount = draft.total_amount_aed;
+  const calculatedAmount = calculated.total_amount_aed;
+
+  const extractedAndCalculatedDiffer =
+    currencyCode === "AED" &&
+    reviewedAmount.trim() !== "" &&
+    calculatedAmount != null &&
+    calculatedAmount !== "" &&
+    Number.isFinite(Number(reviewedAmount)) &&
+    Number.isFinite(Number(calculatedAmount)) &&
+    Math.abs(
+      Number(reviewedAmount) - Number(calculatedAmount),
+    ) >= 0.005;
+
+  // Never compare a USD source amount against an AED reviewed amount.
+  const sourceAndReviewedDiffer =
+    originalCurrency === "AED" &&
+    currencyCode === "AED" &&
+    sourceTotal != null &&
+    sourceTotal !== "" &&
+    reviewedAmount.trim() !== "" &&
+    Number.isFinite(Number(sourceTotal)) &&
+    Number.isFinite(Number(reviewedAmount)) &&
+    Math.abs(
+      Number(sourceTotal) - Number(reviewedAmount),
+    ) >= 0.005;
+
+  // ==========================================================
+  // FORM STATE
+  // ==========================================================
+
+  function setField<K extends keyof Draft>(
+    key: K,
+    value: Draft[K],
+  ) {
+    setDraft((current) => ({
+      ...current,
+      [key]: value,
+    }));
+
+    setValidation(null);
+    setError("");
+    setNotice("");
+  }
+
+  function changeItem(
+    index: number,
+    field: keyof ItemDraft,
+    value: string,
+  ) {
+    if (sourceBlocksAedApproval) return;
+
+    setField(
+      "items",
+      draft.items.map((item, rowIndex) =>
+        rowIndex === index
+          ? { ...item, [field]: value }
+          : item,
+      ),
+    );
+  }
+
+  function selectInvoice(index: number) {
+    setInvoiceIndex(index);
+    setDraft(buildDraft(document, index));
+    setValidation(getValidation(document, index));
+    setApproval(null);
+    setError("");
+    setNotice("");
+  }
+
+  // ==========================================================
+  // API ACTIONS
+  // ==========================================================
+
+  async function saveCorrections() {
+    if (!canEdit || busy !== null) return;
+
+    setBusy("save");
+    setError("");
+    setNotice("");
+
+    try {
+      const updated = await correctDocument(
+        document.id,
+        toPayload(draft, invoiceIndex),
+      );
+
+      onUpdated(updated);
+      setDraft(buildDraft(updated, invoiceIndex));
+      setValidation(getValidation(updated, invoiceIndex));
+
+      setNotice(
+        "Corrections saved and validation recalculated by the server.",
+      );
+    } catch (reason) {
+      setError(
+        reason instanceof Error
+          ? reason.message
+          : "Could not save corrections.",
+      );
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function validateInvoice() {
+    if (!canEdit || busy !== null) return;
+
+    setBusy("validate");
+    setError("");
+    setNotice("");
+
+    try {
+      const result = await validateDocument(
+        document.id,
+        toPayload(draft, invoiceIndex),
+      );
+
+      setValidation(result);
+
+      setNotice(
+        result.is_valid
+          ? "Validation completed. Review warnings before approval."
+          : "Validation found issues that must be resolved before approval.",
+      );
+    } catch (reason) {
+      setError(
+        reason instanceof Error
+          ? reason.message
+          : "Could not validate this invoice.",
+      );
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function approveInvoice() {
+    if (!canApprove || sourceBlocksAedApproval || busy !== null) {
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `Approve invoice ${draft.invoice_number || ""} and add it to the AED invoice register?`,
+    );
+
+    if (!confirmed) return;
+
+    setBusy("approve");
+    setError("");
+    setNotice("");
+
+    try {
+      const result = await approveDocument(
+        document.id,
+        toPayload(draft, invoiceIndex),
+      );
+
+      setApproval(result);
+      setNotice("Invoice approved and added to the register.");
+
+      try {
+        onUpdated(await getDocument(document.id));
+      } catch {
+        setError(
+          "Invoice was approved, but the document status could not be refreshed.",
+        );
+      }
+    } catch (reason) {
+      setError(
+        reason instanceof Error
+          ? reason.message
+          : "Could not approve this invoice.",
+      );
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function rejectInvoice() {
+    if (!canEdit || busy !== null) return;
+
+    const reason = window.prompt(
+      "Enter a reason for rejecting this document:",
+    );
+
+    if (!reason?.trim()) return;
+
+    setBusy("reject");
+    setError("");
+    setNotice("");
+
+    try {
+      await rejectDocument(document.id, reason.trim());
+
+      setNotice("Document rejected.");
+
+      try {
+        onUpdated(await getDocument(document.id));
+      } catch {
+        setError(
+          "Document was rejected, but its latest status could not be refreshed.",
+        );
+      }
+    } catch (cause) {
+      setError(
+        cause instanceof Error
+          ? cause.message
+          : "Could not reject this document.",
+      );
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  // ==========================================================
+  // AED LINE ITEM TABLE
+  // ==========================================================
+
+  function renderItems() {
+    const lineItemsCheck = objectValue(
+      objectValue(validation?.checks).line_items,
+    );
+
+    const lineResults = Array.isArray(lineItemsCheck.results)
+      ? lineItemsCheck.results
+      : [];
+
+    return (
+      <div className="table-responsive">
+        <table className="table table-sm align-middle document-line-items">
+          <thead>
+            <tr>
+              <th scope="col">#</th>
+              {ITEM_COLUMNS.map((column) => (
+                <th scope="col" key={column.key}>
+                  {column.label}
+                </th>
+              ))}
+              <th scope="col">
+                <span className="visually-hidden">Actions</span>
+              </th>
+            </tr>
+          </thead>
+
+          <tbody>
+            {draft.items.length === 0 ? (
+              <tr>
+                <td
+                  colSpan={ITEM_COLUMNS.length + 2}
+                  className="text-center text-secondary py-4"
+                >
+                  No AED accounting line items are available.
+                  Original-currency source rows, when extracted,
+                  are displayed above.
+                </td>
+              </tr>
+            ) : (
+              draft.items.map((item, index) => {
+                const original = objectValue(
+                  originalInvoice.items?.[index],
+                );
+
+                const lineResult = objectValue(lineResults[index]);
+                const calculatedLine = objectValue(
+                  lineResult.calculated,
+                );
+
+                return (
+                  <tr key={index}>
+                    <th scope="row">{index + 1}</th>
+
+                    {ITEM_COLUMNS.map((column) => {
+                      const originalValue = valueString(
+                        original[column.key],
+                      );
+
+                      const changed =
+                        originalValue !== "" &&
+                        originalValue !== item[column.key];
+
+                      const calculatedValue =
+                        calculatedLine[column.key];
+
+                      return (
+                        <td key={column.key}>
+                          <input
+                            className="form-control form-control-sm document-line-input"
+                            type={column.type || "text"}
+                            step={
+                              column.key === "quantity"
+                                ? "0.001"
+                                : column.type === "number"
+                                  ? "0.01"
+                                  : undefined
+                            }
+                            value={item[column.key]}
+                            disabled={
+                              !canEdit || sourceBlocksAedApproval
+                            }
+                            onChange={(
+                              event: ChangeEvent<HTMLInputElement>,
+                            ) =>
+                              changeItem(
+                                index,
+                                column.key,
+                                event.target.value,
+                              )
+                            }
+                            aria-label={`Line ${index + 1} ${column.label}`}
+                          />
+
+                          {changed && (
+                            <small className="document-original-value">
+                              Extracted: {originalValue}
+                            </small>
+                          )}
+
+                          {calculatedValue != null &&
+                            String(calculatedValue) !==
+                              item[column.key] && (
+                              <small className="document-calculated-value">
+                                Calculated: {String(calculatedValue)}
+                              </small>
+                            )}
+                        </td>
+                      );
+                    })}
+
+                    <td>
+                      <button
+                        type="button"
+                        className="btn btn-sm btn-outline-danger"
+                        disabled={
+                          !canEdit || sourceBlocksAedApproval
+                        }
+                        onClick={() =>
+                          setField(
+                            "items",
+                            draft.items.filter(
+                              (_, rowIndex) => rowIndex !== index,
+                            ),
+                          )
+                        }
+                        aria-label={`Remove line item ${index + 1}`}
+                      >
+                        <i className="bi bi-trash" />
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })
+            )}
+          </tbody>
+        </table>
+      </div>
+    );
+  }
+
+  // ==========================================================
+  // JSX
+  // ==========================================================
+
+  return (
+    <div>
+      <div className="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-3">
+        <div>
+          <div className="document-kicker">
+            RECEIVAI DOCUMENT REVIEW
+          </div>
+
+          <h1 className="document-page-title mb-1">
+            Review extracted invoice
+          </h1>
+
+          <p className="small text-secondary mb-0">
+            Verify original document evidence before correcting,
+            validating, or approving AED accounting values.
+          </p>
+        </div>
+
+        <DocumentStatusBadge status={document.processing_status} />
+      </div>
+
+      {invoiceCount === 0 && (
+        <div className="alert alert-warning" role="alert">
+          No structured invoice was identified.
+          Review the uploaded document and retry extraction.
+        </div>
+      )}
+
+      {invoiceCount > 1 && (
+        <div className="document-card mb-3">
+          <label
+            className="form-label fw-semibold"
+            htmlFor="invoice-index-select"
+          >
+            Invoice in this document
+          </label>
+
+          <select
+            id="invoice-index-select"
+            className="form-select"
+            value={invoiceIndex}
+            onChange={(event) =>
+              selectInvoice(Number(event.target.value))
+            }
+          >
+            {invoices.map((value, index) => {
+              const invoice = objectValue(value);
+              const approved = approvedIndices.includes(index);
+
+              return (
+                <option
+                  key={index}
+                  value={index}
+                  disabled={approved}
+                >
+                  Invoice {index + 1} ·{" "}
+                  {valueString(invoice.invoice_number) || "unnumbered"}
+                  {approved ? " · approved" : ""}
+                </option>
+              );
+            })}
+          </select>
+        </div>
+      )}
+
+      {error && (
+        <div className="alert alert-danger py-2" role="alert">
+          {error}
+        </div>
+      )}
+
+      {notice && (
+        <div className="alert alert-info py-2" role="status">
+          {notice}
+        </div>
+      )}
+
+      {approval && (
+        <div className="alert alert-success d-flex flex-wrap justify-content-between align-items-center gap-2">
+          <div>
+            <strong>
+              Invoice {approval.invoice_number} approved.
+            </strong>
+            <div className="small">
+              Created invoice #{approval.invoice_id}.
+            </div>
+          </div>
+
+          <Link
+            className="btn btn-sm btn-success"
+            href={`/invoices/${approval.invoice_id}`}
+          >
+            View invoice details
+          </Link>
+        </div>
+      )}
+
+      {locked && (
+        <div className="alert alert-secondary py-2">
+          This invoice is already {document.processing_status}.
+          Corrections and approval are disabled.
+        </div>
+      )}
+
+      {invoiceCount > 0 && sourceBlocksAedApproval && (
+        <div className="alert alert-warning py-2" role="alert">
+          <strong>AED ledger approval is unavailable.</strong>{" "}
+          The original document is denominated in{" "}
+          {originalCurrency || "an unknown currency"}
+          {isProforma ? " and is classified as proforma" : ""}.
+          Its original financial evidence can be inspected, but
+          it cannot be approved into the AED collections register.
+        </div>
+      )}
+
+      {/* Original-source evidence is independent of AED form values. */}
+
+      {invoiceCount > 0 && (
+        <SourceInvoiceEvidence
+          invoice={originalInvoice}
+          doclingEnrichment={doclingEnrichment}
+          manualReviewRequired={
+            extraction.manual_review_required === true
+          }
+        />
+      )}
+
+      <div className="row g-3 align-items-start mt-1">
+        {/* Left column: preview and extraction details */}
+
+        <div className="col-xl-4">
+          <DocumentDetails
+            document={document}
+            invoiceIndex={invoiceIndex}
+          />
+
+          <ExtractionEvidence invoice={originalInvoice} />
+        </div>
+
+        {/* Right column: editable AED review */}
+
+        <div className="col-xl-8">
+          <form
+            onSubmit={(event) => {
+              event.preventDefault();
+              void approveInvoice();
+            }}
+          >
+            <fieldset
+              disabled={!canEdit}
+              className="document-review-fields"
+            >
+              {/* Supplier */}
+
+              <div className="document-card">
+                <h2 className="document-section-title">
+                  Supplier details
+                </h2>
+
+                <div className="row g-3">
+                  <TextField
+                    label="Supplier name"
+                    value={draft.supplier_name}
+                    required
+                    onChange={(value) =>
+                      setField("supplier_name", value)
+                    }
+                  />
+                  <TextField
+                    label="Supplier address"
+                    value={draft.supplier_address}
+                    onChange={(value) =>
+                      setField("supplier_address", value)
+                    }
+                  />
+                  <TextField
+                    label="Supplier emirate"
+                    value={draft.supplier_emirate}
+                    onChange={(value) =>
+                      setField("supplier_emirate", value)
+                    }
+                  />
+                  <TextField
+                    label="Supplier TRN"
+                    value={draft.supplier_trn}
+                    onChange={(value) =>
+                      setField("supplier_trn", value)
+                    }
+                  />
+                </div>
+              </div>
+
+              {/* Customer */}
+
+              <div className="document-card mt-3">
+                <h2 className="document-section-title">
+                  Buyer details
+                </h2>
+
+                <div className="row g-3">
+                  <TextField
+                    label="Buyer name"
+                    value={draft.customer_name}
+                    required
+                    onChange={(value) =>
+                      setField("customer_name", value)
+                    }
+                  />
+                  <TextField
+                    label="Buyer email"
+                    type="email"
+                    value={draft.customer_email}
+                    onChange={(value) =>
+                      setField("customer_email", value)
+                    }
+                  />
+                  <TextField
+                    label="Buyer address"
+                    value={draft.customer_address}
+                    onChange={(value) =>
+                      setField("customer_address", value)
+                    }
+                  />
+                  <TextField
+                    label="Buyer emirate"
+                    value={draft.customer_emirate}
+                    onChange={(value) =>
+                      setField("customer_emirate", value)
+                    }
+                  />
+                  <TextField
+                    label="Buyer TRN"
+                    value={draft.customer_trn}
+                    onChange={(value) =>
+                      setField("customer_trn", value)
+                    }
+                  />
+                </div>
+              </div>
+
+              {/* Invoice identity */}
+
+              <div className="document-card mt-3">
+                <h2 className="document-section-title">
+                  Invoice information
+                </h2>
+
+                <div className="row g-3">
+                  <TextField
+                    label="Invoice number"
+                    value={draft.invoice_number}
+                    required
+                    onChange={(value) =>
+                      setField("invoice_number", value)
+                    }
+                  />
+
+                  <div className="col-md-6">
+                    <label
+                      className="form-label small fw-semibold"
+                      htmlFor="invoice-type"
+                    >
+                      Document type
+                    </label>
+
+                    <input
+                      id="invoice-type"
+                      className="form-control"
+                      value={draft.invoice_type}
+                      readOnly
+                    />
+
+                    <small className="text-secondary">
+                      The source document type cannot be changed
+                      through the current correction API.
+                    </small>
+                  </div>
+
+                  <TextField
+                    label="Invoice date"
+                    type="date"
+                    value={draft.issue_date}
+                    required
+                    onChange={(value) =>
+                      setField("issue_date", value)
+                    }
+                  />
+                  <TextField
+                    label="Supply date"
+                    type="date"
+                    value={draft.supply_date}
+                    onChange={(value) =>
+                      setField("supply_date", value)
+                    }
+                  />
+                  <TextField
+                    label="Due date"
+                    type="date"
+                    value={draft.due_date}
+                    required
+                    onChange={(value) =>
+                      setField("due_date", value)
+                    }
+                  />
+                  <TextField
+                    label="Place of supply"
+                    value={draft.place_of_supply}
+                    onChange={(value) =>
+                      setField("place_of_supply", value)
+                    }
+                  />
+                  <TextField
+                    label="Currency"
+                    value={draft.currency}
+                    required
+                    onChange={(value) =>
+                      setField("currency", value)
+                    }
+                    placeholder="Confirm currency; not assumed"
+                  />
+                </div>
+
+                {!currencyCode && (
+                  <div className="alert alert-warning py-2 small mt-3 mb-0">
+                    The currency has not been established.
+                    Verify it against the original document.
+                  </div>
+                )}
+              </div>
+
+              {/* AED accounting items */}
+
+              <div className="document-card mt-3">
+                <div className="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-3">
+                  <div>
+                    <h2 className="document-section-title mb-1">
+                      AED accounting line items
+                    </h2>
+
+                    <p className="small text-secondary mb-0">
+                      These rows are separate from the original-currency
+                      evidence shown above.
+                    </p>
+                  </div>
+
+                  <button
+                    type="button"
+                    className="btn btn-outline-primary btn-sm"
+                    disabled={!canEdit || sourceBlocksAedApproval}
+                    onClick={() =>
+                      setField("items", [
+                        ...draft.items,
+                        emptyItem(),
+                      ])
+                    }
+                  >
+                    <i className="bi bi-plus-lg me-2" />
+                    Add line item
+                  </button>
+                </div>
+
+                {renderItems()}
+              </div>
+
+              {/* AED financial totals */}
+
+              <div className="document-card mt-3">
+                <h2 className="document-section-title">
+                  AED accounting financial summary
+                </h2>
+
+                {sourceBlocksAedApproval && (
+                  <div className="alert alert-info py-2 small">
+                    AED financial editing is disabled for this
+                    source document. Its original-currency
+                    financial values are displayed above.
+                  </div>
+                )}
+
+                <fieldset
+                  disabled={sourceBlocksAedApproval}
+                  className="border-0 p-0 m-0"
+                >
+                  <div className="row g-3">
+                    <TextField
+                      label="Extracted subtotal (AED)"
+                      type="number"
+                      value={draft.subtotal_aed}
+                      onChange={(value) =>
+                        setField("subtotal_aed", value)
+                      }
+                    />
+
+                    <TextField
+                      label="Extracted discount (AED)"
+                      type="number"
+                      value={draft.discount_aed}
+                      onChange={(value) =>
+                        setField("discount_aed", value)
+                      }
+                    />
+
+                    <TextField
+                      label="Extracted VAT amount (AED)"
+                      type="number"
+                      value={draft.vat_amount_aed}
+                      onChange={(value) =>
+                        setField("vat_amount_aed", value)
+                      }
+                    />
+
+                    <TextField
+                      label="Reviewed invoice total (AED)"
+                      type="number"
+                      value={draft.total_amount_aed}
+                      onChange={(value) =>
+                        setField("total_amount_aed", value)
+                      }
+                    />
+                  </div>
+                </fieldset>
+
+                <div className="document-financial-grid mt-3">
+                  <div className="document-financial-cell">
+                    <span>Extracted taxable base (AED)</span>
+                    <strong>
+                      {formatAmount(draft.subtotal_aed, "AED")}
+                    </strong>
+                  </div>
+
+                  <div className="document-financial-cell">
+                    <span>Calculated taxable base (AED)</span>
+                    <strong>
+                      {validation
+                        ? formatAmount(calculated.subtotal_aed, "AED")
+                        : "Validate invoice"}
+                    </strong>
+                  </div>
+
+                  <div className="document-financial-cell">
+                    <span>Calculated discount (AED)</span>
+                    <strong>
+                      {validation
+                        ? formatAmount(calculated.discount_aed, "AED")
+                        : "Validate invoice"}
+                    </strong>
+                  </div>
+
+                  <div className="document-financial-cell">
+                    <span>Calculated VAT (AED)</span>
+                    <strong>
+                      {validation
+                        ? formatAmount(calculated.vat_amount_aed, "AED")
+                        : "Validate invoice"}
+                    </strong>
+                  </div>
+
+                  <div className="document-financial-cell">
+                    <span>Source document total</span>
+                    <strong>
+                      {formatAmount(
+                        sourceTotal,
+                        originalCurrency || null,
+                      )}
+                    </strong>
+                  </div>
+
+                  <div className="document-financial-cell">
+                    <span>Reviewed total (AED)</span>
+                    <strong>
+                      {formatAmount(draft.total_amount_aed, "AED")}
+                    </strong>
+                  </div>
+
+                  <div className="document-financial-cell">
+                    <span>Calculated grand total (AED)</span>
+                    <strong>
+                      {validation
+                        ? formatAmount(
+                            calculated.total_amount_aed,
+                            "AED",
+                          )
+                        : "Validate invoice"}
+                    </strong>
+                  </div>
+                </div>
+
+                {sourceAndReviewedDiffer && (
+                  <div className="alert alert-warning py-2 small mt-3 mb-0">
+                    The reviewed AED total differs from the original
+                    AED source total. Verify the financial values.
+                  </div>
+                )}
+
+                {extractedAndCalculatedDiffer && (
+                  <div className="alert alert-warning py-2 small mt-3 mb-0">
+                    The reviewed and independently calculated
+                    AED invoice totals differ.
+                  </div>
+                )}
+
+                {draft.amount_in_words && (
+                  <div className="small text-secondary mt-3">
+                    <strong>Amount in words:</strong>{" "}
+                    {draft.amount_in_words}
+                  </div>
+                )}
+
+                <div className="mt-3">
+                  <label
+                    className="form-label small fw-semibold"
+                    htmlFor="invoice-review-notes"
+                  >
+                    Review notes
+                  </label>
+
+                  <textarea
+                    id="invoice-review-notes"
+                    className="form-control"
+                    rows={2}
+                    value={draft.notes}
+                    onChange={(event) =>
+                      setField("notes", event.target.value)
+                    }
+                  />
+                </div>
+              </div>
+            </fieldset>
+
+            {/* Server validation output */}
+
+            <ValidationPanel result={validation} />
+
+            {/* Review actions */}
+
+            {canEdit && (
+              <div className="document-card mt-3">
+                <div className="d-flex flex-wrap justify-content-between gap-2">
+                  <button
+                    type="button"
+                    className="btn btn-outline-danger"
+                    onClick={() => void rejectInvoice()}
+                    disabled={busy !== null}
+                  >
+                    {busy === "reject"
+                      ? "Rejecting…"
+                      : "Reject invoice"}
+                  </button>
+
+                  <div className="d-flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      className="btn btn-outline-secondary"
+                      onClick={() => void saveCorrections()}
+                      disabled={busy !== null}
+                    >
+                      {busy === "save"
+                        ? "Saving…"
+                        : "Save corrections"}
+                    </button>
+
+                    <button
+                      type="button"
+                      className="btn btn-outline-primary"
+                      onClick={() => void validateInvoice()}
+                      disabled={busy !== null}
+                    >
+                      {busy === "validate"
+                        ? "Validating…"
+                        : "Validate invoice"}
+                    </button>
+
+                    <button
+                      type="submit"
+                      className="btn btn-success"
+                      disabled={!canApprove || busy !== null}
+                      title={
+                        sourceBlocksAedApproval
+                          ? "This source document is not eligible for AED ledger approval."
+                          : !canApprove
+                            ? "Run successful validation after the latest edits."
+                            : undefined
+                      }
+                    >
+                      {busy === "approve"
+                        ? "Approving…"
+                        : "Approve invoice"}
+                    </button>
+                  </div>
+                </div>
+
+                {!canApprove && (
+                  <div className="small text-secondary mt-2">
+                    {sourceBlocksAedApproval
+                      ? "AED ledger approval is unavailable for non-AED, unknown-currency, or proforma source documents."
+                      : "Approval is enabled only after the current invoice values pass validation."}
+                  </div>
+                )}
+              </div>
+            )}
+          </form>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Keep review state tied to the current document identity.
+ */
+export default function InvoiceReview(props: Props) {
+  return (
+    <InvoiceReviewContent
+      key={props.document.id}
+      {...props}
+    />
+  );
+}
